@@ -23,8 +23,15 @@ set_target_properties({{ name }} PROPERTIES
 set_source_files_properties(device.cu PROPERTIES COMPILE_DEFINITIONS TILEFOUNDRY_TARGET_CUDA)
 set_source_files_properties(host.cpp PROPERTIES COMPILE_DEFINITIONS TILEFOUNDRY_TARGET_CPU)
 
+{# The device header needs C++20 (concepts, templated lambdas); the host does #}
+{# not. Stating it as a *standard* property would make CMake vouch for the #}
+{# CUDA20 dialect, and a CMake older than nvcc's C++20 support refuses with #}
+{# "the current compiler NVIDIA does not support this" -- and the property #}
+{# propagates from CXX, so raising either one is enough to trip it. A #}
+{# per-source option lands after the standard flag, and nvcc takes the last #}
+{# -std it is given. #}
 # Device nvcc flags (matches the prior hand-written nvcc command).
-set_source_files_properties(device.cu PROPERTIES COMPILE_OPTIONS "{{ device_options }}")
+set_source_files_properties(device.cu PROPERTIES COMPILE_OPTIONS "-std=c++20;{{ device_options }}")
 
 target_include_directories({{ name }} PRIVATE
 {%- for inc in includes %}

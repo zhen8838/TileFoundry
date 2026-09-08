@@ -1,8 +1,11 @@
 """Exercise every CUDA barrier form emitted for ``T.sync``.
 
-A 128-thread mesh covers whole CTA, single-warp subset, and two named multi-warp
-barriers. Successful completion plus correct output catches invalid masks,
-barrier ids, and deadlocks.
+A 128-thread mesh and three slices of it cover the whole block, a single warp,
+a multi-warp run based at zero, and a multi-warp run based inside the block --
+the four sets ``ops::sync`` picks a different barrier for. Each emits the mesh
+and nothing else, so what the assertions read is the size and base the runtime
+decides from. Successful completion plus correct output catches a barrier the
+wrong threads arrive at, and a deadlock.
 
 See [tir §1.5](docs/spec/tir.md#15-sync).
 """
@@ -21,10 +24,11 @@ from tilefoundry.target import CpuTarget, CudaTarget
 
 
 def test_sync_barrier_forms_emit_expected_cuda() -> None:
-    """The kernel lowers each barrier form to the expected CUDA.
+    """Each ``T.sync`` lowers to its mesh, and to no barrier named beside it.
 
-    The kernel lowers each barrier form to the expected CUDA, with two
-    distinct named-barrier ids for the two multi-warp groups.
+    The whole-block sync reaches for the scope's own alias; each slice carries
+    its sub-box and the base it starts at, which is the pair ``ops::sync``
+    reads to tell a block-wide barrier from a run inside one.
     """
     from tilefoundry.codegen.cuda.module import emit_cuda_module  # noqa: PLC0415
     from tilefoundry.codegen.registry import group_functions_by_target  # noqa: PLC0415
@@ -34,11 +38,25 @@ def test_sync_barrier_forms_emit_expected_cuda() -> None:
     target, functions = next(iter(groups.items()))
     src = emit_cuda_module(lowered, functions, target).source
 
-    assert "SyncKind::syncthreads>();" in src
-    assert "SyncKind::syncwarp_masked, 0, 32, 0xffffffffu>();" in src
+    def mesh(shape: str, base: int, resource: str = "") -> str:
+        layout = (
+            f"cute::Layout<cute::Shape<{shape}>, "
+            "cute::Stride<cute::Int<32>, cute::Int<1>>>"
+        )
+        if base:
+            layout = f"cute::ComposedLayout<cute::identity, cute::Int<{base}>, {layout}>"
+        return (
+            "tilefoundry::ops::sync(tilefoundry::Mesh<"
+            "tilefoundry::Topology<tilefoundry::TopologyScope::thread>, "
+            f"{layout}>{{}}{resource});"
+        )
 
-    assert "SyncKind::bar_sync, 0, 64, 0u, 1>();" in src
-    assert "SyncKind::bar_sync, 64, 64, 0u, 2>();" in src
+    assert "tilefoundry::ops::sync(m_1_mesh_t{});" in src
+    assert mesh("cute::Int<1>, cute::Int<32>", 0) in src
+    assert mesh("cute::Int<2>, cute::Int<32>", 0, ", tilefoundry::ops::bar_id<1>") in src
+    assert mesh("cute::Int<2>, cute::Int<32>", 64, ", tilefoundry::ops::bar_id<2>") in src
+
+    assert "SyncKind" not in src
 
 
 @module(entry="grid_sync_host")
@@ -68,8 +86,8 @@ def test_grid_scope_sync_emits_grid_barrier() -> None:
     target, functions = next(iter(groups.items()))
     src = emit_cuda_module(lowered, functions, target).source
     assert (
-        "tilefoundry::ops::sync<tilefoundry::ops::SyncKind::grid>"
-        "(tilefoundry::tf_grid_bar_state);" in src
+        "tilefoundry::ops::sync(m_1_mesh_t{}, tilefoundry::tf_grid_bar_state);"
+        in src
     )
 
     assert "static __device__ unsigned int tf_grid_bar_state[2];" in src

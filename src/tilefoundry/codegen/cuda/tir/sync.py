@@ -1,53 +1,60 @@
-"""Emitter for the ``tir.Sync`` op — emits the uniform runtime barrier call.
+"""Emitter for the ``tir.Sync`` op — emits the mesh-scoped runtime barrier.
 
-The barrier kind and participant geometry come from ``classify`` /
-``participation`` (shared with verify); the emit passes them as template
-parameters to ``tilefoundry::ops::sync``.
+The mesh is the whole call. Which barrier runs is ``ops::sync``'s own answer,
+read off the ``Mesh`` type's scope, size and base, so the emitted line names who
+must agree and never which instruction does it — and a mesh reshaped upstream
+cannot leave a stale barrier behind at the call site.
+
+``classify`` still runs here for its refusals: a partial grid sync and a ragged
+cross-warp subset are deadlocks, and a ``VerifyError`` before codegen says so
+better than the ``static_assert`` that backs it up inside nvcc.
 """
 from __future__ import annotations
 
 from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
-from tilefoundry.ir.tir.sync import Sync, SyncBarrier, classify, participation
+from tilefoundry.codegen.cuda.tir.stmts.mesh_scope import mesh_type
+from tilefoundry.ir.tir.sync import Sync, SyncBarrier, classify
 
 _SYNC = "tilefoundry::ops::sync"
-_KIND = "tilefoundry::ops::SyncKind"
+
+
+def _mesh_value(mesh, ctx: CodegenContext) -> str:
+    """*mesh* as a C++ value, through the enclosing scope's alias where it fits.
+
+    A ``Mesh`` carries its whole answer in its type, so the value is an empty
+    one; the alias is preferred only so the emitted line reads as the scope the
+    sync is written inside. A slice has its own base and its own size, so it
+    never wears the enclosing alias.
+    """
+    entry = ctx._mesh_aliases.get(id(mesh))
+    if entry is not None:
+        return f"{entry[0]}{{}}"
+    inline = mesh_type(mesh)
+    for alias_name, type_str in ctx._mesh_aliases.values():
+        if type_str == inline:
+            return f"{alias_name}{{}}"
+    return f"{inline}{{}}"
 
 
 @register_codegen_cuda(Sync)
 def _emit(call, ctx: CodegenContext) -> None:
+    """Emit the barrier as the mesh it covers, plus whatever that tier needs.
+
+    Two tiers need something the mesh cannot say. A CTA mesh takes the module's
+    own grid-barrier counter: whether a grid barrier is a counter to spin on or
+    a cooperative launch's grid group is a fact about the launch. A run inside
+    the block takes one of the fifteen named barriers: which are free is a fact
+    about the whole kernel. Both are the emitter's to hand over, because both
+    are known here and neither is knowable inside the op.
+    """
     mesh = call.target.mesh
     barrier = classify(mesh)
-
-
-
+    value = _mesh_value(mesh, ctx)
     if barrier is SyncBarrier.GRID:
-
-
-        ctx.emit(f"{_SYNC}<{_KIND}::grid>(tilefoundry::tf_grid_bar_state);")
+        ctx.emit(f"{_SYNC}({value}, tilefoundry::tf_grid_bar_state);")
         return
-
-    p = participation(mesh)
-
-    if barrier is SyncBarrier.SYNCTHREADS:
-        ctx.emit(f"{_SYNC}<{_KIND}::syncthreads>();")
+    if barrier is SyncBarrier.BAR_SYNC:
+        bid = ctx.alloc_barrier_id()
+        ctx.emit(f"{_SYNC}({value}, tilefoundry::ops::bar_id<{bid}>);")
         return
-
-    if barrier is SyncBarrier.SYNCWARP:
-        if p.full_cta:
-
-            ctx.emit(f"{_SYNC}<{_KIND}::syncwarp_full>();")
-            return
-
-
-        ctx.emit(
-            f"{_SYNC}<{_KIND}::syncwarp_masked, {p.base}, {p.count}, "
-            f"0x{p.lane_mask:08x}u>();"
-        )
-        return
-
-
-
-    bid = ctx.alloc_barrier_id()
-    ctx.emit(
-        f"{_SYNC}<{_KIND}::bar_sync, {p.base}, {p.count}, 0u, {bid}>();"
-    )
+    ctx.emit(f"{_SYNC}({value});")

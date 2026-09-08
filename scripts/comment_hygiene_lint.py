@@ -253,6 +253,27 @@ def _c_comments(text: str) -> list[tuple[int, str, str, bool]]:
     return found
 
 
+def _next_code_line(text: str, after: int) -> str:
+    """The first line of actual code at or below 1-based line *after*."""
+    lines = text.splitlines()
+    for raw in lines[after - 1 :]:
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("///", "//", "*", "/*")):
+            continue
+        return stripped
+    return ""
+
+
+def _asserts_explain_themselves(text: str, end_line: int) -> bool:
+    """Whether the comment ending at *end_line* sits on a ``static_assert``.
+
+    An assertion states its own reason: the message is what a reader sees when
+    it fires, and a comment above it is the same sentence in the place nobody
+    is looking when they need it.
+    """
+    return _next_code_line(text, end_line + 1).startswith("static_assert")
+
+
 def c_findings(text: str) -> list[tuple[int, str]]:
     """Illegal C-family comments and oversized Doxygen prose."""
     found = []
@@ -269,6 +290,13 @@ def c_findings(text: str) -> list[tuple[int, str]]:
                 (
                     line_run[0][0],
                     f"Doxygen block spends {spent} prose lines; limit is {MAX_PROSE_LINES}",
+                )
+            )
+        if _asserts_explain_themselves(text, line_run[-1][0]):
+            found.append(
+                (
+                    line_run[0][0],
+                    "a static_assert states its own reason; put this in its message",
                 )
             )
         line_run.clear()
@@ -300,6 +328,10 @@ def c_findings(text: str) -> list[tuple[int, str]]:
         if marker == "/**" and spent > MAX_PROSE_LINES:
             found.append(
                 (number, f"Doxygen block spends {spent} prose lines; limit is {MAX_PROSE_LINES}")
+            )
+        if _asserts_explain_themselves(text, number + body.count("\n")):
+            found.append(
+                (number, "a static_assert states its own reason; put this in its message")
             )
     finish_line_run()
     return _narration(narration_lines) + found

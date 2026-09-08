@@ -37,7 +37,12 @@ __all__ = ["ReduceKind", "Reduce"]
 
 @register_op
 class Reduce(Op):
-    """Axis reduction over ``x`` (``mean`` / ``sum`` / ``abs_max`` / ``max``)."""
+    """Axis reduction over ``x``, one ``ReduceKind`` per runtime reduce tag.
+
+    ``mean`` / ``sum`` / ``abs_max`` / ``max`` / ``min``, which is exactly what
+    ``reduce_impl::reduce_traits`` specialises on: a kind here with no tag there
+    is a ``KeyError`` in the emitter, and a tag with no kind is unreachable.
+    """
 
     x = ParamDef(kind="input", pattern=Tensor)
     axes = ParamDef(kind="attribute", annotation=tuple)
@@ -59,6 +64,8 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         if kind in (ReduceKind.SUM, ReduceKind.MEAN)
         else frozenset({"max"})
         if kind is ReduceKind.MAX
+        else frozenset({"min"})
+        if kind is ReduceKind.MIN
         else frozenset()
     )
     reject_partials(ctx, call, "x", x_ty.layout, commutes_with=commutes_with)
@@ -103,7 +110,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     )
 
 
-_EMPTY_IDENTITY = (ReduceKind.MAX, ReduceKind.ABS_MAX)
+_EMPTY_IDENTITY = (ReduceKind.MAX, ReduceKind.MIN, ReduceKind.ABS_MAX)
 
 
 def _least_representable(dtype: "torch.dtype"):
@@ -121,6 +128,21 @@ def _least_representable(dtype: "torch.dtype"):
     return negative_infinity if held.item() == negative_infinity else torch.finfo(dtype).min
 
 
+def _greatest_representable(dtype: "torch.dtype"):
+    """The largest value *dtype* can hold.
+
+    The mirror of ``_least_representable``: ``True``, ``iinfo.max``, or ``+inf``
+    where the dtype round-trips it and ``finfo.max`` where it does not.
+    """
+    if dtype is torch.bool:
+        return True
+    if not dtype.is_floating_point:
+        return torch.iinfo(dtype).max
+    infinity = float("inf")
+    held = torch.tensor(infinity, dtype=torch.float32).to(dtype).to(torch.float32)
+    return infinity if held.item() == infinity else torch.finfo(dtype).max
+
+
 @register_eval(Reduce)
 def _eval_reduce(ctx):
     x = ctx.args[0].data
@@ -128,7 +150,12 @@ def _eval_reduce(ctx):
     keepdim = ctx.op.keepdim
     kind = ctx.op.kind
     if kind in _EMPTY_IDENTITY and any(x.shape[axis] == 0 for axis in axes):
-        identity = 0 if kind is ReduceKind.ABS_MAX else _least_representable(x.dtype)
+        if kind is ReduceKind.ABS_MAX:
+            identity = 0
+        elif kind is ReduceKind.MIN:
+            identity = _greatest_representable(x.dtype)
+        else:
+            identity = _least_representable(x.dtype)
         reduced = list(x.shape)
         for axis in axes:
             reduced[axis] = 1
@@ -142,6 +169,8 @@ def _eval_reduce(ctx):
         out = x.abs().amax(dim=axes, keepdim=keepdim)
     elif kind is ReduceKind.MAX:
         out = x.amax(dim=axes, keepdim=keepdim)
+    elif kind is ReduceKind.MIN:
+        out = x.amin(dim=axes, keepdim=keepdim)
     else:
         raise ValueError(f"evaluator: unsupported ReduceKind {kind}")
     return TensorValue(data=out, type=ctx.result_type)

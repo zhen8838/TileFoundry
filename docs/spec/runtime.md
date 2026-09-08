@@ -628,6 +628,18 @@ under `tilefoundry/runtime/cuda/runtime.cuh` (the CPU surface under
 (`runtime/<target>/…`), no intermediate `target/` segment. Generated code MUST
 include only the umbrella header and MUST NOT include target subheaders directly.
 
+`runtime.cuh` also re-exports the CuTe primitives generated code is written in
+terms of — `cute::copy`, `cute::make_tensor` and the layout algebra behind
+`cute::Tensor` ([§2.9](#29-tensor-and-storage)) — so a generated translation
+unit needs no `cute/` include of its own. A re-exported primitive keeps CuTe's
+own contract, which this document does not restate: that `cute::copy` requires
+`size(src) == size(dst)` and compatible element types is CuTe's requirement and
+not one the runtime adds. **A CuTe primitive is not a runtime op** and is not in
+[§3](#3-runtime-ops)'s list; where an op is one of them with the operands
+resolved to this instance's slice first, that op's own entry says so —
+`ops::copy` ([§3.3](#33-tilefoundryopscopy-tile-copy)) is `cute::copy` read that
+way.
+
 ### 2.1 `TopologyScope`
 
 ```cpp
@@ -636,12 +648,18 @@ include only the umbrella header and MUST NOT include target subheaders directly
  */
 enum class TopologyScope {
   cta,          ///< maps to blockIdx
+  warp,         ///< a warp of the block; named here, not queryable (below)
   thread,       ///< maps to threadIdx
   scope_count,  ///< a sentinel
 };
 ```
 
-- constraints: none
+- constraints:
+  - The enumeration is fixed. A level being named here does not make it a
+    program topology level a mesh may bind: codegen admits `cta` and `thread`
+    ([target](./target.md)), and `program_id<warp>()` has no specialization, so
+    a warp-scoped mesh fails to link rather than reading a wrong id. Warp-sized
+    groupings live as an axis of a `thread` mesh's layout.
 
 ### 2.2 Topology Metadata
 
@@ -653,16 +671,16 @@ enum class TopologyScope {
 template <TopologyScope T> auto program_shape() noexcept;
 
 /**
- * @brief Size of topology level T.
+ * @brief Size of topology level T, as `cute::size(program_shape<T>())`.
  * @tparam T the topology level
  */
-template <TopologyScope T> auto program_dim() noexcept;
+template <TopologyScope T> constexpr auto program_dim() noexcept;
 
 /**
  * @brief Linearized scalar runtime id of T (current execution instance).
  * @tparam T the topology level
  */
-template <TopologyScope T> auto program_id() noexcept;
+template <TopologyScope T> size_t program_id() noexcept;
 ```
 
 - constraints:
@@ -680,43 +698,133 @@ always a runtime query returning the current execution instance id.
 
 ```cpp
 /**
- * @brief A device mesh: a CuTe layout whose axes map to program topology levels.
+ * @brief Which level of the launch a mesh spreads over. Nothing else.
+ * @tparam Scope the program topology level
  */
-template <class MeshLayout, TopologyScope... Topos>
-struct Mesh {
-  MeshLayout mesh_layout;                                        ///< a CuTe-compatible layout type
-  static constexpr auto topologies = cute::make_tuple(Topos...); ///< sparse TopologyScope list this mesh uses (type-level, not runtime state)
-  auto local_index() const noexcept;                             ///< full mesh coordinate for this execution instance
+template <TopologyScope Scope>
+struct Topology {
+  static constexpr TopologyScope scope = Scope;  ///< the level, and no extent beside it
 };
+
+/**
+ * @brief A device mesh: one topology level bound to a CuTe mesh layout.
+ * @tparam TTopo a `Topology<Scope>`
+ * @tparam TMeshLayout a `cute::Layout`, or a `cute::ComposedLayout` for a slice
+ */
+template <class TTopo, class TMeshLayout>
+struct Mesh {
+  using topology = TTopo;      ///< the level, as a type
+  using layout = TMeshLayout;  ///< the positions, as a type
+  TMeshLayout layout_value;    ///< the positions, as a value
+};
+
+/**
+ * @brief The first instance a mesh layout covers, in the level's own numbering.
+ * @tparam TMeshLayout the mesh layout
+ */
+template <class TMeshLayout>
+constexpr int mesh_offset();
+
+/**
+ * @brief A mesh layout's positions, with its offset taken off.
+ * @param layout the mesh layout
+ */
+template <class L>
+constexpr auto mesh_positions(L const& layout);
+
+/**
+ * @brief A mesh over `extents`, row-major, starting at instance zero.
+ * @tparam Scope the program topology level
+ * @param extents the per-axis position counts
+ */
+template <TopologyScope Scope, class Extents>
+constexpr auto make_mesh(Extents const& extents);
 ```
 
 - constraints:
-  - Axes-to-topology mapping: axes are partitioned into contiguous groups, matched
-    from the **end** of `mesh_layout.shape` backwards, in **reverse** `topologies`
-    tuple order. For each topology, greedily consume consecutive trailing axes
-    until their product equals that topology's device count.
-  - `local_index()` — for each topology in `topologies`, calls `program_id<T>()`
-    to get the runtime id, converts each runtime id to sub-coordinates via
-    `idx2crd(id, sub_shape, sub_stride)`, and concatenates into a full mesh
-    coordinate (CuTe coord / int-tuple).
-  - for each topology `T` in `topologies`, the product of its assigned axes'
-    extents equals the device count of `T`
+  - `Mesh` carries a level and a layout, the same two the IR `Mesh` has beside
+    its axis names ([shard §5](./shard.md#5-mesh)). It is an aggregate, so a
+    second statement of the same fact is a second place for it to be wrong:
+    how many instances a mesh has is `cute::size(Mesh::layout)` and how they
+    are shaped is `cute::shape(...)`. `Topology` states no extent, and `Mesh`
+    no base.
+  - One level per mesh. An IR mesh naming several levels lowers to the first;
+    finer groupings (a warp of a block) are an axis of the layout, not a second
+    `Topology`.
+  - The stride order of `make_mesh` is what turns a linear instance id into a
+    coordinate: extents `(8, 32)` row-major give `(id / 32, id % 32)`, so a
+    thread mesh names its warps first and its lanes last.
+  - No `local_index()`. A mesh coordinate is derived where it is used, from the
+    instance id the level reports: `mesh_positions(layout_value)
+    .get_hier_coord(program_id<topology::scope>() - mesh_offset<layout>())`
+    ([§2.10.1](#2101-inputs)). A mesh holds no runtime state of its own.
+
+A narrowed mesh — threads 64..127 of a 128-thread block — is not a third field.
+The IR spells the slice `ComposedLayout(inner, offset, outer)`, a layout mapping
+a coordinate to `offset + outer(c)` ([shard §4](./shard.md#4-composedlayout)),
+and the C++ mesh mirrors it with the CuTe type of the same name, whose
+`operator()` is literally `layout_a()(offset() + layout_b()(c))`:
+
+```cpp
+// example: threads 64..127 of a 128-thread block, as (2 warps, 32 lanes)
+Mesh<Topology<TopologyScope::thread>,
+     cute::ComposedLayout<cute::identity, cute::Int<64>,
+                          cute::Layout<cute::Shape<cute::Int<2>, cute::Int<32>>,
+                                       cute::Stride<cute::Int<32>, cute::Int<1>>>>>
+```
+
+- constraints:
+  - Only this shape of `cute::ComposedLayout` is a mesh: `cute::identity` over a
+    static offset. A swizzle in the first slot, or a dynamic offset, is a mesh
+    whose first instance is not a compile-time number, and every reader wants it
+    as one.
+  - `mesh_offset<L>()` is that offset, or `0` for a plain layout;
+    `mesh_positions(l)` is `layout_b()` for a composed layout and `l` itself
+    otherwise, so one spelling serves both at every call site.
+  - The offset MUST NOT be dropped. `mesh_positions` maps a coordinate to an
+    instance *within* the mesh; only the offset turns that into an instance of
+    the launch. Reading a coordinate off a raw instance id instead hands every
+    instance of a slice the box its neighbour owns.
+  - A plain `cute::Layout` is the whole launch level at offset zero — the case
+    every mesh was before slices existed — and `cute::size` of either is the
+    participant count, since a composed layout's size is `layout_b()`'s.
 
 ### 2.4 `tilefoundry::ShardLayout`
 
 ```cpp
 /**
- * @brief A plain layout / attrs / mesh aggregate.
+ * @brief A layout, its per-axis shard attributes, and the mesh they run over.
+ * @tparam TLayout the underlying CuTe layout
+ * @tparam TAttrs shard attributes, ordered by mesh axis
+ * @tparam TMesh the bound device domain
  */
-template <class Layout, class Attrs, class Mesh>
+template <class TLayout, class TAttrs, class TMesh>
 struct ShardLayout {
-  Layout layout;   ///< the underlying CuTe layout
-  Attrs attrs;     ///< shard attributes, ordered by mesh axis
-  Mesh mesh;       ///< the bound device domain
+  using layout = TLayout;    ///< the layout, as a type
+  using attrs = TAttrs;      ///< the attributes; a type only, they carry no state
+  using mesh = TMesh;        ///< the mesh, as a type
+  TLayout layout_value;      ///< the layout, as a value (dynamic extents are real)
+  TMesh mesh_value;          ///< the mesh, as a value
 };
+
+/**
+ * @brief Package a layout, a mesh, and attributes without reinterpreting them.
+ * @param layout a CuTe layout, or a shape whose strides come out row-major
+ * @param mesh the bound device domain
+ */
+template <class TLayout, class TMesh, class Attrs>
+constexpr auto make_shard_layout(TLayout const& layout, TMesh const& mesh, Attrs const&);
 ```
 
-- constraints: none
+- constraints:
+  - `TAttrs` is a `cute::tuple` of empty tags ([§2.5](#25-tilefoundryshard--shard-attributes)),
+    so the aggregate holds no attribute value; the attributes are read off the
+    type. Every extent and stride that is not a compile-time fact lives in
+    `layout_value` / `mesh_value`.
+  - `make_shard_layout` is to `ShardLayout` what `cute::make_layout` is to
+    `cute::Layout`: the axes are the caller's and the attributes point at them
+    as written. It does not refactor the shape
+    ([shard §7.1.1](./shard.md#711-layoutshape) states that factorisation).
 
 ### 2.5 `tilefoundry::shard` — Shard Attributes
 
@@ -739,14 +847,14 @@ Shorthand: `S<Axis>` = Split, `B` = Broadcast, `P<Reduction>` = Partial.
 /**
  * @brief A CuTe tensor/view paired with its runtime shard layout.
  */
-template <class Engine_, class GlobalLayout_, class ShardLayout_>
+template <class TEngine, class TGlobalLayout, class TShardLayout>
 struct ShardTensor {
-  using engine_type = Engine_;
-  using global_layout_type = GlobalLayout_;
-  using shard_layout_type = ShardLayout_;
-  Engine_ engine;             ///< CuTe tensor/view (gmem/smem/rmem); raw pointer rejected
-  ShardLayout_ shard_layout;  ///< runtime shard-layout value (dynamic dims carry real extents)
-  auto data();                ///< underlying pointer of the wrapped cute tensor
+  using engine_type = TEngine;
+  using global_layout_type = TGlobalLayout;
+  using shard_layout_type = TShardLayout;
+  TEngine engine;              ///< CuTe tensor/view (gmem/smem/rmem); raw pointer rejected
+  TShardLayout shard_layout;   ///< runtime shard-layout value (dynamic dims carry real extents)
+  auto data();                 ///< underlying pointer of the wrapped cute tensor
   auto data() const;
 };
 ```
@@ -804,10 +912,43 @@ void copy(ShardTensor<T, GL, SL> const& src, DT& dst);
  */
 template <class ST, class T, class GL, class SL>
 void copy(ST const& src, ShardTensor<T, GL, SL>& dst);
+
+/**
+ * @brief Copy this instance's slice, shard → shard.
+ * @param src the shard-tensor source
+ * @param dst the shard-tensor destination
+ */
+template <class TS, class GLS, class SLS, class TD, class GLD, class SLD>
+void copy(ShardTensor<TS, GLS, SLS> const& src, ShardTensor<TD, GLD, SLD>& dst);
+
+/**
+ * @brief Copy the full tensor, plain → plain.
+ * @param src the source tensor
+ * @param dst the destination tensor
+ */
+template <class ST, class DT>
+void copy(ST const& src, DT& dst);
 ```
 
 - constraints:
-  - No additional constraints.
+  - Each overload copies what `local()` ([§2.10](#210-local)) leaves this
+    execution instance, so a copy the mesh splits across threads is a
+    thread-scoped shard layout rather than a strided loop at the call site.
+  - **The move width is a property of the layouts, not of the call.** It is the
+    largest power of two both operands run contiguously over —
+    `max_common_vector` of the two *projected* layouts, which
+    [§2.10.2](#2102-computation) derives statically from the shard layout and
+    the mesh — capped so neither side's move exceeds 16 bytes.
+  - A dtype change does not force the width to one element: the wide load still
+    holds and the conversion happens on the way out. The cap follows the wider
+    of the two element types.
+  - Register fragments take the element path. Addressing `&frag(i)` under a loop
+    the compiler cannot unroll spills the fragment to local memory, which costs
+    more than the wider move saves.
+  - Where the shard's offset lands is the one thing a layout cannot state, so
+    the implementation tests the two base pointers against the width's alignment
+    and falls back to the element path when it does not hold. That is one
+    comparison, not a scan.
 
 ### 2.10 `local()`
 
@@ -825,9 +966,12 @@ auto local(ShardTensor<E, GL, SL> const& t) noexcept;
 
 #### 2.10.1 Inputs
 
-Let `t: ShardTensor`, `sl = t.shard_layout`, `S = sl.layout.strides`,
-`A = sl.attrs`, and `coord = sl.mesh.local_index()`
-([§2.3](#23-tilefoundrymesh)).
+Let `t: ShardTensor`, `sl = t.shard_layout`, `S = sl.layout_value`'s
+strides, `A = SL::attrs`, and `coord` the mesh coordinate of this instance:
+`mesh_positions(sl.mesh_value.layout_value).get_hier_coord(id - offset)` for
+`id = program_id<scope>()` and `offset = mesh_offset<mesh::layout>()`
+([§2.3](#23-tilefoundrymesh)). Subtracting the offset is what makes a slice's
+first instance its own coordinate zero.
 
 - `t.engine` is the per-instance cute tensor / view; `t.engine.data()`
   is the base ptr the current instance already holds.
@@ -895,6 +1039,30 @@ flowchart LR
     Entry --> SimpleImpl["single impl helper"]
 ```
 
+**What is an op.** An op's behaviour is derivable from the layout system's
+description of its arguments: its operands are `ShardTensor`s or a `Mesh`, and
+its tier is read off their layouts. That admits exactly seven entries, and
+`ops::` holds these and nothing else:
+
+| entry | operands the geometry comes from |
+| --- | --- |
+| `elementwise` ([§3.8](#38-tilefoundryopselementwise-pointwise)) | the destination's local domain, and a stride-0 mode wherever a source broadcasts |
+| `copy` ([§3.3](#33-tilefoundryopscopy-tile-copy)) / `copy_async` ([§3.4](#34-tilefoundryopscopy_async-async-gmemsmem-staging)) | both operands' shard layouts: shape, strides, share and move width |
+| `reduce` ([§3.2](#32-tilefoundryopsreduce-reduction-family)) | the axes the destination broadcasts that the source splits |
+| `dot` ([§3.7](#37-tilefoundryopsdot-fused-multiply-contract)) | the axes the operands' meshes contract |
+| `mma` ([§3.6](#36-tilefoundryopsmma-matrix-multiply-accumulate)) | rank-2 static layouts are a tile; the warp count is the accumulator's mesh |
+| `sync` ([§3.1](#31-tilefoundryopssync-mesh-scoped-barrier)) | the mesh's scope, base and count |
+| `tma_copy` ([§3.5](#35-tilefoundryopstma_copy-barrier-completing-gmemsmem-staging)) | both shard layouts, asserted: one contiguous run each, whole tiles, matching element types |
+
+Anything that takes a raw pointer, an `int` or a type and answers a question
+about it is not an op but a utility, and belongs outside `ops::` — the
+warp-scoped primitives of [§4](#4-warp-primitives) and the `mbarrier`
+instructions a caller writes around `tma_copy` are both that. In particular the
+runtime publishes **no predicate and no constant reporting which tier an op
+selected or how wide a move it chose**: a caller cannot use one to decide how to
+build its operands, since the answer is a function of the operand types it would
+already have had to build, and putting the tier behind one entry was the point.
+
 **Runtime-owned dispatch.** Where an op has more than one implementation tier
 (selected by scope or by operand layout), the runtime exposes exactly **one**
 public entry — never one op per tier. The active tier is derived at **compile
@@ -902,21 +1070,23 @@ time** from the operand `ShardLayout`s, together with any codegen-static geometr
 passed as template parameters, through a template trait, and is selected inside
 the entry (`if constexpr`). Codegen emits one uniform call per op and never
 selects a tier, computes a per-tier parameter, or carries the selection on the
-TIR op. `ops::reduce` ([§3.5](#35-tilefoundryopsreduce-reduction-family))
+TIR op. `ops::reduce` ([§3.2](#32-tilefoundryopsreduce-reduction-family))
 derives its reduction level from the operand shard layouts and `ops::sync`
-([§3.4](#34-tilefoundryopssync-mesh-scoped-barrier)) derives its participant
+([§3.1](#31-tilefoundryopssync-mesh-scoped-barrier)) derives its participant
 predicate from the barrier geometry; both are instances of this principle. A
 target runtime implementation MAY select an internal optimized load/store path
 (such as a wider vector copy) behind this single entry without changing the
-public entry or its observable result. The
-codegen side is
+public entry or its observable result. The codegen side is
 [codegen §3](./codegen.md#3-runtime-owned-op-dispatch).
 
-Elementwise ops (`cast`, `copy_n`, `clamp`, `unary` — including `relu`, which
-has no dedicated `ops::relu` entry) route through the shared
-`unary_impl::Unary<Op>` skeleton parameterised by a functor tag (e.g.
-`relu_op`, `identity_op`, `clamp_op`); codegen always calls the family's one
-public entry with the tag as an argument.
+**One pointwise op.** Every elementwise operation — fill, cast, clamp, `relu`,
+add, multiply, and every broadcast shape of those — is the single entry
+`ops::elementwise` ([§3.8](#38-tilefoundryopselementwise-pointwise)). Arity
+is the length of its source pack, the operation is the callable it takes, and a
+broadcast operand is a stride-0 mode on that operand's layout. None of those
+three is a name: there is no `ops::fill`, `ops::cast`, `ops::unary`,
+`ops::binary`, or `ops::binary_bcast_*`, and adding one would be re-encoding in
+a symbol what an argument already states.
 
 **Annotation convention.** `ops::*` public entries, their internal impl
 functors, and op tags MUST be annotated `__device__` (their bodies are
@@ -924,89 +1094,71 @@ device-only). `CUTE_HOST_DEVICE` MUST be reserved for tensor-view / layout
 helpers genuinely capable of host compilation (e.g. `local()`,
 `make_shard_tensor`, `tilefoundry::copy`).
 
-### 3.1 `cute::copy`
+### 3.1 `tilefoundry::ops::sync` (mesh-scoped barrier)
 
 ```cpp
 /**
- * @brief Copy data from src to dst.
- * @param src the source tensor
- * @param dst the destination tensor
+ * @brief Barrier over every instance of a mesh.
+ * @param mesh the participants; its scope and layout pick the barrier
  */
-template <class SrcTensor, class DstTensor>
-void copy(SrcTensor const& src, DstTensor& dst);
+template <class TTopo, class TLayout>
+__device__ void sync(Mesh<TTopo, TLayout> const& mesh);
+
+/** @param bar the module's two-word grid-barrier counter pair, or nullptr */
+template <class TTopo, class TLayout>
+__device__ void sync(Mesh<TTopo, TLayout> const& mesh, unsigned int* bar);
+
+/** @param id one of the fifteen named hardware barriers, 1..15 */
+template <class TTopo, class TLayout, int Id>
+__device__ void sync(Mesh<TTopo, TLayout> const& mesh, BarrierId<Id> id);
 ```
 
 - constraints:
-  - `size(src) == size(dst)`
-  - source and destination dtypes are compatible
-
-### 3.2 `cute::fill`
-
-```cpp
-/**
- * @brief Fill tensor with scalar val.
- * @param tensor the destination tensor
- * @param val the scalar fill value
- */
-template <class Tensor, class Value>
-void fill(Tensor& tensor, Value val);
-```
-
-- constraints: none
-
-### 3.3 `tilefoundry::shard_partition`
-
-```cpp
-/**
- * @brief Project tensor to the current device coordinate's local view.
- * @param tensor a tensor whose layout() is a ShardLayout
- */
-template <class Tensor>
-auto shard_partition(Tensor const& tensor);
-```
-
-- constraints:
-  - extracts `mesh` from `tensor.layout()`
-  - calls `mesh.local_index()` to get the current device coordinate
-  - projects the tensor to the local view at that coordinate
-  - returns a `cute::Tensor` with plain CuTe layout
-  - `tensor.layout()` is a `ShardLayout`
-
-### 3.4 `tilefoundry::ops::sync` (mesh-scoped barrier)
-
-```cpp
-/**
- * @brief Mesh-scoped barrier.
- * @tparam Kind compile-time barrier kind; selects CTA, warp, named-barrier, or grid behavior
- * @tparam Base compile-time participant geometry
- * @tparam Count compile-time participant geometry
- * @tparam Mask compile-time participant geometry
- * @tparam BarId compile-time named-barrier id
- * @param grid_bar optional two-word global counter pair used only by grid barriers
- */
-template <SyncKind Kind, int Base = 0, int Count = 0, unsigned Mask = 0u, int BarId = 0>
-__device__ void sync(unsigned int* grid_bar = nullptr);
-```
-
-- constraints:
+  - Which barrier runs is the mesh's own answer and never a call-site template
+    argument: the topology scope says the level, and the mesh layout says both
+    how many instances (`size(layout)`) and which instance the run starts at
+    (its offset — a sliced mesh is a `cute::ComposedLayout` mapping a coordinate
+    to `offset + outer(c)`, ([§2.3](#23-tilefoundrymesh))).
+  - The classification MUST agree case for case with `classify` in
+    `ir/tir/sync.py`: an un-sliced `cta` mesh takes the grid barrier; a mesh
+    covering the whole block takes the warp's convergence when the block is one
+    warp wide and the block barrier otherwise; a mesh fitting inside one warp
+    takes the warp's convergence; a warp-aligned run covering part of the block
+    takes a named barrier.
+  - Two meshes name no barrier and are rejected at the call site: a sliced `cta`
+    mesh (the CTAs outside it never arrive) and a cross-warp run whose base or
+    count is not a multiple of 32 (part of a warp would be inside the barrier
+    and part outside). Both are deadlocks, not slow paths.
+  - The runtime states which tier needs which resource and allocates none. A
+    caller that supplies none where one is needed MUST fail to compile with a
+    message naming the resource; a caller that supplies the wrong one MUST fail
+    the same way. A grid counter is a fact about the launch and a free named
+    barrier a fact about the whole kernel; neither is knowable from one mesh.
+  - A named barrier id MUST be a compile-time value in `1..15`. Id `0` is the
+    one `__syncthreads` arrives at and MUST be rejected: `bar.sync` counts
+    arrivals per id, so a subset posted to it releases a whole-block barrier
+    early. An id MUST NOT be derived from the mesh — two meshes sharing a base
+    and differing in count would collide.
   - Codegen emits only `sync`; it does not call lower-level barrier helpers.
   - Grid barriers require every CTA of the launch to be co-resident and to
     execute the barrier.
   - A grid barrier's counter pair is zero-initialized before first use and is
-    owned by the generated module.
+    owned by the generated module. Whether one exists is a fact about the
+    launch, so the caller passes it; with none, a cooperative launch's grid
+    group is used instead.
 
-### 3.5 `tilefoundry::ops::reduce` (reduction family)
+### 3.2 `tilefoundry::ops::reduce` (reduction family)
 
 ```cpp
 /**
  * @brief Reduce src into dst along Axes.
- * @tparam Op compile-time combine tag (sum, mean, max, absmax)
+ * @tparam Op compile-time combine tag (add_op, mean_op, max_op, min_op, absmax_op)
  * @tparam Axes compile-time reduced logical axes
  * @param src source operand; sharded operands carry ShardLayout
  * @param dst destination operand; sharded operands carry ShardLayout
- * @param ws optional shared-memory workspace; no_workspace keeps the reduce within one warp
+ * @param ws shared-memory workspace, one slot per warp; required exactly when the layouts cross warps
  */
-template <class Op, class Axes, class Src, class Dst, class Ws = no_workspace>
+template <class Op, class Axes, class Src, class Dst, class Ws = reduce_impl::no_workspace_t>
 __device__ void reduce(Src const& src, Dst& dst, Ws&& ws = {});
 ```
 
@@ -1014,12 +1166,45 @@ __device__ void reduce(Src const& src, Dst& dst, Ws&& ws = {});
   - `reduce` is the only public runtime reduce entry; tier names and helper
     functions are internal.
   - Sharded operands derive the active tier and warp grouping from `(src, dst)`
-    shard layouts inside the runtime.
+    shard layouts inside the runtime. `ws` is a *resource the layouts demand*
+    and never the tier selector: a reduce mesh that stays inside one warp takes
+    the intra-warp tier and needs no workspace, and one that crosses warps does
+    not compile without one.
+  - Both operands name one mesh and give one attr per mesh axis; the reduced
+    set is `src[i]` split or partial against `dst[i]` broadcast.
+  - The combine domain is `float` — `init`, `elem`, `combine` and `finalize`
+    all are — so an element type `float` cannot hold exactly (a 4- or 8-byte
+    integer, a packed key) is refused at the entry rather than rounded.
   - Plain operands derive extents from the operand rank and size inside the
     runtime.
   - A reduction whose reduced axis crosses CTA boundaries is not supported.
 
-### 3.6 `tilefoundry::ops::copy_async` (async gmem→smem staging)
+### 3.3 `tilefoundry::ops::copy` (tile copy)
+
+The op-surface spelling of `tilefoundry::copy` ([§2.8](#28-tilefoundrycopy--shard-aware-overloads)):
+one entry, taking tensors, with the transfer shape, the strides, the element
+types, the share this instance owns and the move width all read off the operand
+`ShardLayout`s.
+
+```cpp
+/**
+ * @brief Copy src into dst, at the width their shard layouts admit.
+ * @param src the source tile
+ * @param dst the destination tile
+ */
+template <class TSrc, class TDst>
+__device__ void copy(TSrc const& src, TDst& dst);
+```
+
+- constraints:
+  - The width rule, the dtype-change rule, the register-fragment rule and the
+    alignment fallback are [§2.8](#28-tilefoundrycopy--shard-aware-overloads)'s
+    and are not restated here.
+  - The call site names no vector width and no thread index. A copy split across
+    a block's threads is a thread-scoped mesh in the operands' shard layouts;
+    the entry then copies exactly the slice `local()` hands each thread.
+
+### 3.4 `tilefoundry::ops::copy_async` (async gmem→smem staging)
 
 ```cpp
 /**
@@ -1034,5 +1219,301 @@ __device__ void copy_async(TSrc const& src, TDst& dst);
 - constraints:
   - The call is non-blocking; generated code orders later reads through
     `cp_async_commit` and `cp_async_wait`.
-  - Runtime implementation details such as vector width, tail handling, and
-    architecture fallback live in code comments, not this spec entry.
+  - The name is the contract: a pair of projected views `cp.async` cannot move
+    a 4-byte-or-wider word of does not compile, and takes `ops::copy`
+    ([§3.3](#33-tilefoundryopscopy-tile-copy)) instead. There is no synchronous
+    tier hiding under this entry for the caller to wait on.
+  - The two projected slices hold the same number of elements. Where an
+    instance owns part of a wider destination, that is the destination's shard
+    layout to state; the source's offset is not borrowed for it.
+  - Runtime implementation details such as vector width and tail handling live
+    in code comments, not this spec entry.
+
+### 3.5 `tilefoundry::ops::tma_copy` (barrier-completing gmem→smem staging)
+
+Stage a tile into shared memory and signal an mbarrier when it is readable. It
+is not a tier of `ops::copy_async`
+([§3.4](#34-tilefoundryopscopy_async-async-gmemsmem-staging)): there every
+thread issues its own load and a commit closes the group, so the thread that
+issues is the thread that waits; here completion lands on a barrier, which is
+what lets a consumer wait for a tile it did not fetch.
+
+```cpp
+/**
+ * @brief Stage src into dst, completing on bar.
+ * @param src the source tile
+ * @param dst the shared destination tile
+ * @param bar the mbarrier the completion lands on
+ */
+template <class Src, class Dst>
+__device__ void tma_copy(Src const& src, Dst& dst, uint64_t* bar);
+```
+
+- constraints:
+  - The operands are tensors, not addresses: the entry takes the transfer shape,
+    the strides and the element type from the operand `ShardLayout`s. A caller
+    passing a pointer and a byte count would be choosing the tier itself, which
+    is what [§3](#3-runtime-ops) puts behind one entry.
+  - **One instruction, and a run-time hand-off.** `cp.async.bulk` moves the run:
+    one elected thread issues it, nothing blocks, and it is still in flight at
+    the next statement. A byte count off the 16-byte grain hands off to the
+    element path at run time, every thread in the block taking part. Which one
+    runs is not a compile-time choice: the operands must satisfy the
+    preconditions below, and a layout that fails them is refused, not routed
+    elsewhere. It was a static tier once, selected on whether either operand
+    coalesces to one run — but a layout that fails that test is exactly a layout
+    the element path addresses wrongly, so the failing branch computed a wrong
+    answer instead of rejecting the call.
+  - Both paths leave `bar` completing when the data is readable, and both are
+    safe to call from every thread in the block. Consumers wait on the phase and
+    never learn which ran.
+  - constraints on the operands, each a `static_assert`: every mesh axis leaves
+    both tiles whole (neither is split across instances); the destination is a
+    `ShardTensor` (the element path needs its mesh for the instance count and
+    the barrier); both projections are one contiguous run; the element types
+    match, since bytes move unconverted; and the two slices are the same size,
+    because the count is read off the source and written at the destination's
+    origin.
+  - `bar` is a resource parameter, the way `ops::reduce`'s `ws` is: a 64-bit
+    shared-memory word, not a sharded tensor, so it carries no `ShardLayout` and
+    there is nothing for a tier to read off it. Arming that word, testing its
+    phase and releasing it are single `mbarrier.*` instructions which read
+    nothing off a layout either, so they are **not ops** and the runtime
+    publishes no entries for them; a caller writes them where it builds the
+    ring. The phase parity alternates `0, 1, 0, ...` across successive
+    completions, which is what lets a fixed ring of barriers serve a stream of
+    any length: stage `t` of a ring of `n` waits on parity `(t / n) & 1`.
+  - The bulk tier's arrival declares the byte count on the instruction that
+    issues the copy, so the declared and delivered counts are one expression and
+    cannot drift; the caller does not arrive separately.
+  - The transfer must be a whole number of 16-byte grains for the instruction to
+    have defined behaviour. The extent is what the shard leaves behind, not a
+    property of the layout type, so an off-grain extent is a run-time hand-off
+    to the element path inside the same entry — same barrier, same result.
+
+### 3.6 `tilefoundry::ops::mma` (matrix multiply-accumulate)
+
+`c += a @ b`, one entry, with the tier read off the operand layouts: rank-2
+static shard layouts on `a` and `b` are a tile and the entry loops the atom over
+it; anything else is a lane's already-gathered fragment and takes the single
+instruction. Codegen emits this one call either way.
+
+```cpp
+/**
+ * @brief c += a @ b, over a tile or over one lane's fragments.
+ * @param a the left operand, (M, K) for a tile
+ * @param b the right operand, (N, K) for a tile
+ * @param c the accumulator
+ */
+template <class TA, class TB, class TC>
+__device__ void mma(TA const& a, TB const& b, TC& c);
+```
+
+- constraints:
+  - The tile tier reads `a` as `(M, K)` and `b` as `(N, K)`. **There is no
+    transpose flag.** Whether the buffer behind `b` is k-major or n-major is a
+    stride in its layout, and the indexing picks that up, so the same call reads
+    both.
+  - `M` and `K` must be whole multiples of the atom's `16` and `16`, and every
+    warp must receive a whole number of `N` atoms of `8`. Violations are
+    `static_assert`s, not run-time checks.
+  - Warps split `N`. The warp count comes from the accumulator's mesh — that is
+    what `c` being a `ShardTensor` is for — not from `blockDim`.
+  - The accumulator's engine is the lane's own registers, which is what
+    `local()` ([§2.10](#210-local)) hands back for register storage, while its
+    `ShardLayout` states which entries of the tile those registers are: the
+    fragment map is warp-split over `N` and lane-split within each atom, and
+    saying so is the layout's job, not an accessor's. **The runtime publishes no
+    fragment-coordinate function and no accumulator constructor.** A caller that
+    needs the map writes it as modes and attrs, the way it writes any other
+    layout, and the tile it moves the fragment to or from is then the same map
+    over a buffer — so rescaling a row of the accumulator or storing it out is
+    one `ops::elementwise` ([§3.8](#38-tilefoundryopselementwise-pointwise))
+    between two shards of one layout, with no fragment index at the call site.
+  - Today's atom is `SM80_16x8x16_F32BF16BF16F32_TN`: bf16 operands, f32
+    accumulate. Another instruction is another atom under the same entry, not
+    another entry.
+
+### 3.7 `tilefoundry::ops::dot` (fused multiply-contract)
+
+`dst = sum(lhs * rhs)`. A matrix-vector product's inner loop is one statement,
+not an `elementwise` followed by a `reduce`
+([§3.2](#32-tilefoundryopsreduce-reduction-family)): materialising the product
+first would cost a register per element of the row, which is what makes that
+pair the wrong spelling here.
+
+```cpp
+/**
+ * @brief dst = sum(lhs * rhs) over the axes the operands' meshes contract.
+ * @param lhs the left operand
+ * @param rhs the right operand
+ * @param dst the destination cell
+ * @param ws optional shared workspace, one slot per warp
+ */
+template <class Lhs, class Rhs, class Dst, class Ws = reduce_impl::no_workspace_t>
+__device__ void dot(Lhs const& lhs, Rhs const& rhs, Dst& dst, Ws&& ws = {});
+```
+
+- constraints:
+  - **Two tiers, one entry.** With no workspace the contraction lives inside a
+    warp and one butterfly finishes it; with a workspace it spans the block,
+    each warp posting a partial into a slot. Either way every participant leaves
+    holding the total, so a caller never broadcasts it back.
+  - The load width is the operands' shard layouts', the same question
+    [§2.8](#28-tilefoundrycopy--shard-aware-overloads) answers for `copy`: the
+    run both sides share, capped by what both are aligned for and by 16 bytes.
+    A row split so that a lane owns four contiguous elements loads eight bytes
+    at a time; one that leaves it eight loads sixteen. The width appears neither
+    at the call site nor on the op surface — the runtime derives it inside the
+    entry and publishes nothing that reports it, for the reason
+    [§3](#3-runtime-ops) gives for publishing no tier predicate.
+  - The fold uses a fixed number of independent partial accumulators, and the
+    tree that combines them is this op's summation order. One running sum would
+    make a row a chain of dependent multiply-adds, and the loads could not run
+    ahead of it: what a warp then waits on is the row's latency, not its bytes.
+  - Accumulation is f32 regardless of the operand type.
+
+### 3.8 `tilefoundry::ops::elementwise` (pointwise)
+
+`dst(i) = fn(src(i)...)` over the destination's local domain. The one pointwise
+op: arity is the pack's length, the operation is `fn`, and a broadcast operand
+is a stride-0 mode on that operand's layout.
+
+```cpp
+/**
+ * @brief dst(i) = fn(src(i)...) over the destination's local domain.
+ * @param dst the destination tensor
+ * @param fn any callable of as many arguments as there are sources
+ * @param src zero or more source tensors, read at the same index
+ */
+template <class Fn, class TOut, class... TIn>
+__device__ void elementwise(TOut& dst, Fn fn, TIn const&... src);
+```
+
+- constraints:
+  - **`dst` and `fn` lead**, because the sources are a variadic pack. Zero
+    sources is a fill, one is a map, two a combine; the same instantiation
+    serves all three.
+  - `fn` is any callable, so the op tags (`mul_op`, `relu_op`, `clamp_op`, …)
+    are valid `fn` values as they stand. There is no separate tag path and
+    lambda path.
+  - **The extent is `size()` of the projected destination.** No count
+    parameter: a hand-passed one is a second statement of a fact the layout
+    already holds, free to disagree with it.
+  - **No shape or domain check.** A mismatched operand is a codegen bug, and
+    shapes are computed on the compile side.
+  - **The only conversion is the one `dst(i) = ...` implies.** The runtime
+    performs no `static_cast` of its own — it does not choose a compute
+    precision. A caller that wants one states it in `fn` (`float(x) * scale`),
+    which mirrors TIR, where a cast is a `Cast` node.
+  - **Broadcast is a layout fact.** A per-row scale is the operand read through
+    `(M, K):(1, 0)`, a per-column weight through `(M, K):(0, 1)`, a scalar
+    through `(N):(0)`. `compose` states this against the operand's own layout,
+    so a strided or sharded operand is read where it actually lies.
+
+## 4. Warp Primitives
+
+`tilefoundry::shuffle_xor`, `tilefoundry::shuffle_elect` and
+`tilefoundry::warp_reduce` (`runtime/cuda/utility/warp.cuh`) are the runtime's
+warp-scoped primitives: part of its callable surface, and no part of its op
+surface.
+
+**What is a warp primitive.** An op takes tensors and reads its geometry off
+their shard layouts ([§3](#3-runtime-ops)). A warp primitive takes a value and a
+lane count — in one case not even that, only the calling thread's own id — so
+there is no layout for a tier selection to read and nothing an operand would
+have stated; each is one instruction or a short run of them, with one
+implementation and no tier at all. That admits exactly three entries, and the
+runtime's warp-scoped surface holds these and nothing else:
+
+| entry | what it takes instead of a layout |
+| --- | --- |
+| `shuffle_xor` ([§4.1](#41-tilefoundryshuffle_xor)) | one lane's value, the lane-id bits to exchange across, the participating lanes |
+| `shuffle_elect` ([§4.2](#42-tilefoundryshuffle_elect)) | nothing; the answer is a fact about the calling thread's id |
+| `warp_reduce` ([§4.3](#43-tilefoundrywarp_reduce)) | one lane's value, a combine functor, and the lanes per fold |
+
+Being outside `ops::` is not licence to grow. A candidate taking a
+`ShardTensor` or a `Mesh` is an op, and belongs in [§3](#3-runtime-ops)'s closed
+list or nowhere; a candidate offering a template parameter the hardware then
+clamps to one value is not an entry at all, because a parameter every value but
+one is clamped away from states nothing.
+
+**Why both surfaces exist.** `ops::reduce`
+([§3.2](#32-tilefoundryopsreduce-reduction-family)) is the op for folding a
+*tensor* over a mesh, and it is built on the butterfly of
+[§4.3](#43-tilefoundrywarp_reduce) — `utility/warp.cuh` is included before
+`ops/reduce.cuh` so the intra-warp tier folds through `warp_reduce` rather than
+spelling the butterfly a second time. A caller folding something it just
+computed, rather than something it stored, has no tensor to hand an op and
+reaches for the primitive.
+
+### 4.1 `tilefoundry::shuffle_xor`
+
+```cpp
+/**
+ * @brief Exchange a value with the lane whose id differs by lane_mask.
+ * @param value this lane's contribution
+ * @param lane_mask the lane-id bits exchanged across
+ * @param member_mask the participating lanes
+ */
+template <class T>
+__device__ T shuffle_xor(T value, int lane_mask, unsigned member_mask = 0xFFFFFFFFu);
+```
+
+- constraints:
+  - The exchange is warp-scoped: a lane's result is defined only where the lane
+    it pairs with is in `member_mask`.
+  - A `T` the shuffle intrinsic does not take directly is exchanged word-wise,
+    and one whose size is not a whole number of 4-byte words MUST fail to
+    compile. Which types the intrinsic takes is a code-level fact and lives in
+    code comments, not this entry.
+
+### 4.2 `tilefoundry::shuffle_elect`
+
+```cpp
+/**
+ * @brief Select exactly one thread of the CTA.
+ */
+__device__ bool shuffle_elect();
+```
+
+- constraints:
+  - It elects one thread of the **CTA**, not one lane of each warp. An mbarrier
+    armed for a single arrival is correct only under that reading.
+  - **It takes no width and no participating-thread count.** The elected thread
+    is always in the first warp, so a leading run wider than a warp elects what
+    32 threads would, and electing among fewer is a different instruction rather
+    than a parameter of this one.
+  - Which thread is asked is the linearised thread id
+    ([§2.2](#22-topology-metadata)) and not `threadIdx.x`, so ids `0..31` are
+    the first warp whatever shape the block has. A thread outside that run
+    answers `false` without reaching the warp-scoped election, whose result is
+    defined only for the lanes in its member mask.
+
+### 4.3 `tilefoundry::warp_reduce`
+
+```cpp
+/**
+ * @brief Fold value across each aligned run of Width lanes.
+ * @tparam Combine a binary functor, called as Combine{}(a, b)
+ * @tparam Width lanes per fold, a power of two in 2..32
+ * @param value this lane's contribution
+ */
+template <class Combine, int Width = 32, class T>
+__device__ T warp_reduce(T value);
+```
+
+- constraints:
+  - A butterfly over `Width` lanes — `log2(Width)` shuffles — which leaves the
+    run's result in **every** lane of the run, not only in its first.
+  - `Width` MUST be a power of two in `2..32`; a violation is a
+    `static_assert`, not a run-time check.
+  - A `Width` under 32 leaves the runs independent, which is what a per-row
+    reduction over a tile laid out several rows to a warp needs. The
+    alternatives are a shared round trip or leaving every lane but one row's
+    idle.
+  - `Combine` is invoked as `Combine{}(a, b)` — the spelling `ops::elementwise`
+    ([§3.8](#38-tilefoundryopselementwise-pointwise)) and `ops::reduce`
+    ([§3.2](#32-tilefoundryopsreduce-reduction-family)) use, so a merge is
+    defined once for all three and the op tags are valid `Combine` values as
+    they stand.

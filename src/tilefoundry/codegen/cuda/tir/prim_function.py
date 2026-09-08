@@ -142,7 +142,6 @@ def _compute_kernel_fields(node: PrimFunction, ctx: CodegenContext) -> _KernelFi
             if isinstance(dim, DimVar) and dim.name not in ctx._dim_var_runtime:
                 ctx._dim_var_runtime[dim.name] = shape_var_name(p.name, axis)
 
-
     ctx.reset_barrier_ids()
 
     entry_host_only = bool(node.variants)
